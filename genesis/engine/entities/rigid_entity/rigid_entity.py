@@ -1,3 +1,4 @@
+import math
 import inspect
 from copy import copy
 from itertools import chain
@@ -20,7 +21,7 @@ from genesis.utils import mesh as mu
 from genesis.utils import mjcf as mju
 from genesis.utils import terrain as tu
 from genesis.utils import urdf as uu
-from genesis.utils.misc import DeprecationError, broadcast_tensor, ti_to_torch
+from genesis.utils.misc import DeprecationError, broadcast_tensor, ti_to_torch, tensor_to_array
 from genesis.engine.states.entities import RigidEntityState
 
 from ..base_entity import Entity
@@ -32,6 +33,115 @@ from .rigid_link import RigidLink
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
     from genesis.engine.solvers.rigid.rigid_solver_decomp import RigidSolver
+
+
+def to_np(x):
+    if isinstance(x, np.ndarray):
+        return x
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+def quat_to_R_xyzw(q):
+    """
+    q: (4,) in [x, y, z, w]
+    return: (3,3)
+    """
+    x, y, z, w = q
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    return np.array([
+        [1 - 2*(yy + zz),     2*(xy - wz),       2*(xz + wy)],
+        [2*(xy + wz),         1 - 2*(xx + zz),   2*(yz - wx)],
+        [2*(xz - wy),         2*(yz + wx),       1 - 2*(xx + yy)],
+    ], dtype=np.float64)
+
+def R_to_quat_xyzw(R):
+    """
+    return q in [x, y, z, w]
+    """
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+
+    tr = m00 + m11 + m22
+    if tr > 0:
+        S = np.sqrt(tr + 1.0) * 2
+        w = 0.25 * S
+        x = (m21 - m12) / S
+        y = (m02 - m20) / S
+        z = (m10 - m01) / S
+    elif (m00 > m11) and (m00 > m22):
+        S = np.sqrt(1.0 + m00 - m11 - m22) * 2
+        w = (m21 - m12) / S
+        x = 0.25 * S
+        y = (m01 + m10) / S
+        z = (m02 + m20) / S
+    elif m11 > m22:
+        S = np.sqrt(1.0 + m11 - m00 - m22) * 2
+        w = (m02 - m20) / S
+        x = (m01 + m10) / S
+        y = 0.25 * S
+        z = (m12 + m21) / S
+    else:
+        S = np.sqrt(1.0 + m22 - m00 - m11) * 2
+        w = (m10 - m01) / S
+        x = (m02 + m20) / S
+        y = (m12 + m21) / S
+        z = 0.25 * S
+
+    q = np.array([x, y, z, w], dtype=np.float64)
+    # normalize
+    q = q / (np.linalg.norm(q) + 1e-12)
+    return q
+
+def pose_to_T(pos, quat, quat_order="xyzw"):
+    pos = to_np(pos).reshape(3)
+    quat = to_np(quat).reshape(4)
+
+    if quat_order == "wxyz":
+        # convert [w,x,y,z] -> [x,y,z,w]
+        quat = np.array([quat[1], quat[2], quat[3], quat[0]], dtype=np.float64)
+
+    R = quat_to_R_xyzw(quat)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = pos
+    return T
+
+def T_to_pose(T, quat_order="xyzw"):
+    T = to_np(T)
+    pos = T[:3, 3].astype(np.float64)
+    quat_xyzw = R_to_quat_xyzw(T[:3, :3])
+
+    if quat_order == "wxyz":
+        quat = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float64)
+    else:
+        quat = quat_xyzw
+    return pos, quat
+
+def resolve_link_idx_by_name(robot, link_name: str) -> int:
+    for attr in ["_link_name_to_idx", "link_name_to_idx", "_links_name_to_idx", "links_name_to_idx"]:
+        if hasattr(robot, attr):
+            m = getattr(robot, attr)
+            if isinstance(m, dict) and link_name in m:
+                return int(m[link_name])
+
+    for attr in ["link_names", "_link_names", "links_name", "_links_name"]:
+        if hasattr(robot, attr):
+            names = list(getattr(robot, attr))
+            if link_name in names:
+                return int(names.index(link_name))
+
+    for attr in ["links", "_links"]:
+        if hasattr(robot, attr):
+            links = getattr(robot, attr)
+            for i, lk in enumerate(links):
+                if getattr(lk, "name", None) == link_name:
+                    return int(i)
+
+    gs.raise_exception(f"Cannot resolve link index from name: {link_name}")
 
 
 # Wrapper to track the arguments of a function and save them in the target buffer
@@ -1571,6 +1681,484 @@ class RigidEntity(Entity):
     # ------------------------------------------------------------------------------------
     # --------------------------------- motion planing -----------------------------------
     # ------------------------------------------------------------------------------------
+
+    @gs.assert_built
+    # def plan_path_ompl(
+    #     self,
+    #     qpos_goal,
+    #     qpos_start=None,
+    #     resolution=0.01,
+    #     timeout=5.0,
+    #     max_retry=1,
+    #     smooth_path=True,
+    #     num_waypoints=100,
+    #     ignore_collision=False,
+    #     ignore_joint_limit=False,
+    #     planner="RRTConnect",
+    # ):
+    #     """
+    #     Plan a path from `qpos_start` to `qpos_goal`.
+    #
+    #     Parameters
+    #     ----------
+    #     qpos_goal : array_like
+    #         The goal state.
+    #     qpos_start : None | array_like, optional
+    #         The start state. If None, the current state of the rigid entity will be used. Defaults to None.
+    #     resolution : float, optiona
+    #         Joint-space resolution in pourcentage. It corresponds to the maximum distance between states to be checked
+    #         for validity along a path segment. Default to 1%.
+    #     timeout : float, optional
+    #         The maximum time (in seconds) allowed for the motion planning algorithm to find a solution. Defaults to 5.0.
+    #     max_retry : float, optional
+    #         Maximum number of retry in case of timeout or convergence failure. Default to 1.
+    #     smooth_path : bool, optional
+    #         Whether to smooth the path after finding a solution. Defaults to True.
+    #     num_waypoints : int, optional
+    #         The number of waypoints to interpolate the path. If None, no interpolation will be performed. Defaults to 100.
+    #     ignore_collision : bool, optional
+    #         Whether to ignore collision checking during motion planning. Defaults to False.
+    #     ignore_joint_limit : bool, optional
+    #         This option has been deprecated and is not longer doing anything.
+    #     planner : str, optional
+    #         The name of the motion planning algorithm to use. Supported planners: 'PRM', 'RRT', 'RRTConnect', 'RRTstar', 'EST', 'FMT', 'BITstar', 'ABITstar'. Defaults to 'RRTConnect'.
+    #
+    #     Returns
+    #     -------
+    #     waypoints : list
+    #         A list of waypoints representing the planned path. Each waypoint is an array storing the entity's qpos of a single time step.
+    #     """
+    #
+    #     ########## validate ##########
+    #     try:
+    #         from ompl import base as ob
+    #         from ompl import geometric as og
+    #         from ompl import util as ou
+    #     except ImportError as e:
+    #         if gs.platform == "Windows":
+    #             gs.raise_exception_from("No pre-compiled binaries of OMPL are not distributed on Windows OS.", e)
+    #         else:
+    #             raise
+    #
+    #     assert timeout > 0.0 and math.isfinite(timeout)
+    #     assert max_retry > 0
+    #
+    #     if self._solver.n_envs > 0:
+    #         gs.raise_exception("Motion planning is not supported for batched envs (yet).")
+    #
+    #     if self.n_qs != self.n_dofs:
+    #         gs.raise_exception("Motion planning is not yet supported for rigid entities with free joints.")
+    #
+    #     if qpos_start is None:
+    #         qpos_start = self.get_qpos()
+    #     qpos_start = tensor_to_array(qpos_start)
+    #     qpos_goal = tensor_to_array(qpos_goal)
+    #
+    #     if qpos_start.shape != (self.n_qs,) or qpos_goal.shape != (self.n_qs,):
+    #         gs.raise_exception("Invalid shape for `qpos_start` or `qpos_goal`.")
+    #
+    #     ######### process joint limit ##########
+    #     if ignore_joint_limit:
+    #         gs.logger.warning("This option is deprecated and is no longer doing anything.")
+    #     q_limit_lower, q_limit_upper = self.q_limit[0], self.q_limit[1]
+    #
+    #     if (qpos_start < q_limit_lower).any() or (qpos_start > q_limit_upper).any():
+    #         gs.logger.warning(
+    #             "`qpos_start` exceeds joint limit. Relaxing joint limit to contain `qpos_start` for planning."
+    #         )
+    #         q_limit_lower = np.minimum(q_limit_lower, qpos_start)
+    #         q_limit_upper = np.maximum(q_limit_upper, qpos_start)
+    #
+    #     if (qpos_goal < q_limit_lower).any() or (qpos_goal > q_limit_upper).any():
+    #         gs.logger.warning(
+    #             "`qpos_goal` exceeds joint limit. Relaxing joint limit to contain `qpos_goal` for planning."
+    #         )
+    #         q_limit_lower = np.minimum(q_limit_lower, qpos_goal)
+    #         q_limit_upper = np.maximum(q_limit_upper, qpos_goal)
+    #
+    #     ######### setup OMPL ##########
+    #     ou.setLogLevel(ou.LOG_ERROR)
+    #     space = ob.RealVectorStateSpace(self.n_qs)
+    #     bounds = ob.RealVectorBounds(self.n_qs)
+    #
+    #     for i_q in range(self.n_qs):
+    #         # bounds.setLow(i_q, q_limit_lower[i_q])
+    #         # bounds.setHigh(i_q, q_limit_upper[i_q])
+    #         bounds.setLow(i_q, float(q_limit_lower[i_q]))
+    #         bounds.setHigh(i_q, float(q_limit_upper[i_q]))
+    #     space.setBounds(bounds)
+    #     ss = og.SimpleSetup(space)
+    #
+    #     geoms_idx = tuple(range(self._geom_start, self._geom_start + len(self._geoms)))
+    #     mask_collision_pairs = set(
+    #         (i_ga, i_gb) for i_ga, i_gb in self.detect_collision() if i_ga in geoms_idx or i_gb in geoms_idx
+    #     )
+    #
+    #     if not ignore_collision and mask_collision_pairs:
+    #         gs.logger.info("Ignoring collision pairs already active for starting pos.")
+    #
+    #     def is_ompl_state_valid(state):
+    #         if ignore_collision:
+    #             return True
+    #         qpos = torch.tensor([state[i] for i in range(self.n_qs)], dtype=gs.tc_float, device=gs.device)
+    #         self.set_qpos(qpos, zero_velocity=False)
+    #         collision_pairs = set(map(tuple, self.detect_collision()))
+    #         return not (collision_pairs - mask_collision_pairs)
+    #
+    #     ss.setStateValidityChecker(ob.StateValidityCheckerFn(is_ompl_state_valid))
+    #
+    #     si = ss.getSpaceInformation()
+    #     si.setStateValidityCheckingResolution(resolution)
+    #
+    #     def allocOBValidStateSampler(si):
+    #         vss = ob.UniformValidStateSampler(si)
+    #         vss.setNrAttempts(100)
+    #         return vss
+    #
+    #     si.setValidStateSamplerAllocator(ob.ValidStateSamplerAllocator(allocOBValidStateSampler))
+    #
+    #     try:
+    #         planner_cls = getattr(og, planner)
+    #         if not issubclass(planner_cls, ob.Planner):
+    #             raise ValueError
+    #         planner = planner_cls(si)
+    #     except (AttributeError, ValueError) as e:
+    #         gs.raise_exception_from(f"'{planner}' is not a valid planner. See OMPL documentation for details.", e)
+    #     ss.setPlanner(planner)
+    #
+    #     state_start = ob.State(space)
+    #     state_goal = ob.State(space)
+    #     for i_q in range(self.n_qs):
+    #         state_start[i_q] = float(qpos_start[i_q])
+    #         state_goal[i_q] = float(qpos_goal[i_q])
+    #     ss.setStartAndGoalStates(state_start, state_goal)
+    #
+    #     ######### solve ##########
+    #     waypoints = []
+    #     for i in range(max_retry):
+    #         # Try solve the motion planning problem
+    #         if ss.getPlanner():
+    #             ss.getPlanner().clear()
+    #         status = ss.solve(timeout)
+    #         status_type = status.getStatus()
+    #
+    #         # Check if there was some unrecoverable failure
+    #         if status_type in (
+    #             ob.PlannerStatus.StatusType.UNKNOWN,
+    #             ob.PlannerStatus.StatusType.CRASH,
+    #             ob.PlannerStatus.StatusType.ABORT,
+    #         ):
+    #             gs.raise_exception("Unknown error.")
+    #         if status_type in (
+    #             ob.PlannerStatus.StatusType.INVALID_START,
+    #             ob.PlannerStatus.StatusType.INVALID_GOAL,
+    #             ob.PlannerStatus.StatusType.UNRECOGNIZED_GOAL_TYPE,
+    #             ob.PlannerStatus.StatusType.INFEASIBLE,
+    #         ):
+    #             gs.logger.warning("Path planning infeasible. Returning empty path.")
+    #             break
+    #
+    #         # Extract solution if any
+    #         if status:
+    #             # ss.simplifySolution()
+    #             path = ss.getSolutionPath()
+    #
+    #             # Simplify path
+    #             if smooth_path:
+    #                 ps = og.PathSimplifier(si)
+    #                 try:
+    #                     # ps.simplifyMax(path)
+    #                     ps.partialShortcutPath(path)
+    #                     ps.ropeShortcutPath(path)
+    #                 except:
+    #                     ps.shortcutPath(path)
+    #                 ps.smoothBSpline(path)
+    #
+    #             # Interpolate path
+    #             if num_waypoints is not None:
+    #                 path.interpolate(num_waypoints)
+    #
+    #             # Extract waypoints
+    #             waypoints = [
+    #                 torch.as_tensor([state[i] for i in range(self.n_qs)], dtype=gs.tc_float, device=gs.device)
+    #                 for state in path.getStates()
+    #             ]
+    #
+    #         # Return once an exact solution was found or maximum number of iterations was reached
+    #         if status_type in (ob.PlannerStatus.StatusType.TIMEOUT, ob.PlannerStatus.StatusType.APPROXIMATE_SOLUTION):
+    #             if i + 1 < max_retry:
+    #                 gs.logger.warning("Path planning did not converge. Trying again...")
+    #                 continue
+    #             else:
+    #                 if waypoints:
+    #                     gs.logger.warning("Path planning did not converge. Returning approximation path.")
+    #                 else:
+    #                     gs.logger.warning("Path planning did not converge. Returning empty path.")
+    #                 break
+    #         gs.logger.info("Path solution found successfully.")
+    #         break
+    #
+    #     ########## restore original state #########
+    #     self.set_qpos(qpos_start, zero_velocity=False)
+    #
+    #     return waypoints
+
+    def plan_path_ompl(
+            self,
+            qpos_goal,
+            qpos_start=None,
+            resolution=0.01,
+            timeout=5.0,
+            max_retry=1,
+            smooth_path=True,
+            num_waypoints=100,
+            ignore_collision=False,
+            ignore_joint_limit=False,
+            planner="RRTConnect",
+            ee_link_name: str | None = None,
+            with_entity=None,
+    ):
+        """
+        Plan a path from `qpos_start` to `qpos_goal`.
+
+        NEW
+        ---
+        ee_link_name : str
+            The name of the link, which we "attach" the object during the planning
+        with_entity : RigidEntity
+            The (non-articulated) object to "attach" during the planning
+        """
+
+        ########## validate ##########
+        try:
+            from ompl import base as ob
+            from ompl import geometric as og
+            from ompl import util as ou
+        except ImportError as e:
+            if gs.platform == "Windows":
+                gs.raise_exception_from("No pre-compiled binaries of OMPL are not distributed on Windows OS.", e)
+            else:
+                raise
+
+        assert timeout > 0.0 and math.isfinite(timeout)
+        assert max_retry > 0
+
+        if self._solver.n_envs > 0:
+            gs.raise_exception("Motion planning is not supported for batched envs (yet).")
+
+        if self.n_qs != self.n_dofs:
+            gs.raise_exception("Motion planning is not yet supported for rigid entities with free joints.")
+
+        if qpos_start is None:
+            qpos_start = self.get_qpos()
+        qpos_start = tensor_to_array(qpos_start)
+        qpos_goal = tensor_to_array(qpos_goal)
+
+        if qpos_start.shape != (self.n_qs,) or qpos_goal.shape != (self.n_qs,):
+            gs.raise_exception("Invalid shape for `qpos_start` or `qpos_goal`.")
+
+        ######### process joint limit ##########
+        if ignore_joint_limit:
+            gs.logger.warning("This option is deprecated and is no longer doing anything.")
+        q_limit_lower, q_limit_upper = self.q_limit[0], self.q_limit[1]
+
+        if (qpos_start < q_limit_lower).any() or (qpos_start > q_limit_upper).any():
+            gs.logger.warning(
+                "`qpos_start` exceeds joint limit. Relaxing joint limit to contain `qpos_start` for planning.")
+            q_limit_lower = np.minimum(q_limit_lower, qpos_start)
+            q_limit_upper = np.maximum(q_limit_upper, qpos_start)
+
+        if (qpos_goal < q_limit_lower).any() or (qpos_goal > q_limit_upper).any():
+            gs.logger.warning(
+                "`qpos_goal` exceeds joint limit. Relaxing joint limit to contain `qpos_goal` for planning.")
+            q_limit_lower = np.minimum(q_limit_lower, qpos_goal)
+            q_limit_upper = np.maximum(q_limit_upper, qpos_goal)
+
+        ######### attach setup ##########
+        use_attach = (ee_link_name is not None) and (with_entity is not None)
+        if (ee_link_name is None) ^ (with_entity is None):
+            gs.raise_exception("If you pass ee_link_name or with_entity, you must pass both.")
+
+        _orig_obj_pose_T = None
+        _T_ee_obj = None
+
+        def _inv_T(T):
+            R = T[:3, :3]
+            t = T[:3, 3]
+            Ti = np.eye(4)
+            Ti[:3, :3] = R.T
+            Ti[:3, 3] = -R.T @ t
+            return Ti
+
+        _QUAT_ORDER = "wxyz"
+
+        def _get_link_pose_T(link_name: str):
+            link_idx = (self, link_name)
+            pos = self._solver.get_links_pos(link_idx, None)[..., 0, :]
+            quat = self._solver.get_links_quat(link_idx, None)[..., 0, :]
+
+            return pose_to_T(pos, quat, quat_order=_QUAT_ORDER)
+
+        def _get_entity_pose_T(ent):
+            pos = ent.get_pos(envs_idx=None)
+            quat = ent.get_quat(envs_idx=None)
+            return pose_to_T(pos, quat, quat_order=_QUAT_ORDER)
+
+        def _set_entity_pose_T(ent, T):
+            pos, quat = T_to_pose(T, quat_order=_QUAT_ORDER)
+            ent.set_pos(pos, envs_idx=None, zero_velocity=False, relative=False)
+            ent.set_quat(quat, envs_idx=None, zero_velocity=False, relative=False)
+
+        if use_attach:
+            self.set_qpos(torch.as_tensor(qpos_start, dtype=gs.tc_float, device=gs.device), zero_velocity=False)
+
+            _orig_obj_pose_T = _get_entity_pose_T(with_entity)
+            world_T_ee0 = _get_link_pose_T(ee_link_name)
+            _T_ee_obj = _inv_T(world_T_ee0) @ _orig_obj_pose_T
+
+        ######### setup OMPL ##########
+        ou.setLogLevel(ou.LOG_ERROR)
+        space = ob.RealVectorStateSpace(self.n_qs)
+        bounds = ob.RealVectorBounds(self.n_qs)
+
+        for i_q in range(self.n_qs):
+            bounds.setLow(i_q, float(q_limit_lower[i_q]))
+            bounds.setHigh(i_q, float(q_limit_upper[i_q]))
+        space.setBounds(bounds)
+        ss = og.SimpleSetup(space)
+
+        geoms_idx_robot = tuple(range(self._geom_start, self._geom_start + len(self._geoms)))
+
+        geoms_idx_obj = ()
+        if use_attach:
+            geoms_idx_obj = tuple(range(with_entity._geom_start, with_entity._geom_start + len(with_entity._geoms)))
+
+        geoms_idx_all = geoms_idx_robot + geoms_idx_obj
+
+        mask_collision_pairs = set(
+            (i_ga, i_gb)
+            for i_ga, i_gb in self.detect_collision()
+            if (i_ga in geoms_idx_all) or (i_gb in geoms_idx_all)
+        )
+
+        if not ignore_collision and mask_collision_pairs:
+            gs.logger.info("Ignoring collision pairs already active for starting pos (robot/attached object).")
+
+        def _update_attached_object_pose_if_needed():
+            if not use_attach:
+                return
+            world_T_ee = _get_link_pose_T(ee_link_name)
+            world_T_obj = world_T_ee @ _T_ee_obj
+            _set_entity_pose_T(with_entity, world_T_obj)
+
+        def is_ompl_state_valid(state):
+            if ignore_collision:
+                return True
+
+            # 1) set robot qpos
+            qpos = torch.tensor([state[i] for i in range(self.n_qs)], dtype=gs.tc_float, device=gs.device)
+            self.set_qpos(qpos, zero_velocity=False)
+
+            # 2) if attached, move object with ee
+            _update_attached_object_pose_if_needed()
+
+            # 3) collision check (robot + attached object)
+            collision_pairs = set(map(tuple, self.detect_collision()))
+            return not (collision_pairs - mask_collision_pairs)
+
+        ss.setStateValidityChecker(ob.StateValidityCheckerFn(is_ompl_state_valid))
+
+        si = ss.getSpaceInformation()
+        si.setStateValidityCheckingResolution(resolution)
+
+        def allocOBValidStateSampler(si):
+            vss = ob.UniformValidStateSampler(si)
+            vss.setNrAttempts(100)
+            return vss
+
+        si.setValidStateSamplerAllocator(ob.ValidStateSamplerAllocator(allocOBValidStateSampler))
+
+        try:
+            planner_cls = getattr(og, planner)
+            if not issubclass(planner_cls, ob.Planner):
+                raise ValueError
+            planner = planner_cls(si)
+        except (AttributeError, ValueError) as e:
+            gs.raise_exception_from(f"'{planner}' is not a valid planner. See OMPL documentation for details.", e)
+        ss.setPlanner(planner)
+
+        state_start = ob.State(space)
+        state_goal = ob.State(space)
+        for i_q in range(self.n_qs):
+            state_start[i_q] = float(qpos_start[i_q])
+            state_goal[i_q] = float(qpos_goal[i_q])
+        ss.setStartAndGoalStates(state_start, state_goal)
+
+        ######### solve ##########
+        waypoints = []
+        for i in range(max_retry):
+            if ss.getPlanner():
+                ss.getPlanner().clear()
+
+            status = ss.solve(timeout)
+            status_type = status.getStatus()
+
+            if status_type in (
+                    ob.PlannerStatus.StatusType.UNKNOWN,
+                    ob.PlannerStatus.StatusType.CRASH,
+                    ob.PlannerStatus.StatusType.ABORT,
+            ):
+                gs.raise_exception("Unknown error.")
+
+            if status_type in (
+                    ob.PlannerStatus.StatusType.INVALID_START,
+                    ob.PlannerStatus.StatusType.INVALID_GOAL,
+                    ob.PlannerStatus.StatusType.UNRECOGNIZED_GOAL_TYPE,
+                    ob.PlannerStatus.StatusType.INFEASIBLE,
+            ):
+                gs.logger.warning("Path planning infeasible. Returning empty path.")
+                break
+
+            if status:
+                path = ss.getSolutionPath()
+
+                if smooth_path:
+                    ps = og.PathSimplifier(si)
+                    try:
+                        ps.partialShortcutPath(path)
+                        ps.ropeShortcutPath(path)
+                    except:
+                        ps.shortcutPath(path)
+                    ps.smoothBSpline(path)
+
+                if num_waypoints is not None:
+                    path.interpolate(num_waypoints)
+
+                waypoints = [
+                    torch.as_tensor([st[i] for i in range(self.n_qs)], dtype=gs.tc_float, device=gs.device)
+                    for st in path.getStates()
+                ]
+
+            if status_type in (ob.PlannerStatus.StatusType.TIMEOUT, ob.PlannerStatus.StatusType.APPROXIMATE_SOLUTION):
+                if i + 1 < max_retry:
+                    gs.logger.warning("Path planning did not converge. Trying again...")
+                    continue
+                else:
+                    if waypoints:
+                        gs.logger.warning("Path planning did not converge. Returning approximation path.")
+                    else:
+                        gs.logger.warning("Path planning did not converge. Returning empty path.")
+                    break
+
+            gs.logger.info("Path solution found successfully.")
+            break
+
+        ########## restore original state #########
+        self.set_qpos(qpos_start, zero_velocity=False)
+        if use_attach and (_orig_obj_pose_T is not None):
+            _set_entity_pose_T(with_entity, _orig_obj_pose_T)
+
+        return waypoints
 
     @gs.assert_built
     def plan_path(
