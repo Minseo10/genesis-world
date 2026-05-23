@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import genesis as gs
+import math
 
 
 ########################## init ##########################
@@ -9,27 +10,37 @@ gs.init(backend=gs.gpu)
 ########################## create a scene ##########################
 scene = gs.Scene(
     viewer_options=gs.options.ViewerOptions(
-        camera_pos=(3, -1, 1.5),
-        camera_lookat=(0.0, 0.0, 0.5),
+        camera_pos=(3, -1, 1.0),
+        camera_lookat=(0.0, 0.0, 0.2),
         camera_fov=30,
-        max_FPS=60,
+        max_FPS=100,
     ),
     sim_options=gs.options.SimOptions(
         dt=0.01,
     ),
     show_viewer=True,
+    show_FPS=False,
 )
 
 ########################## entities ##########################
 plane = scene.add_entity(
     gs.morphs.Plane(),
 )
-cube = scene.add_entity(
-    gs.morphs.Box(
-        size=(0.04, 0.04, 0.04),
-        pos=(0.65, 0.0, 0.02),
-    )
-)
+# cube = scene.add_entity(
+#     gs.morphs.Box(
+#         size=(0.04, 0.04, 0.04),
+#         pos=(0.65, 0.0, 0.02),
+#     )
+# )
+hook = scene.add_entity(
+            morph=gs.morphs.URDF(
+                file="/home/minseo/Genesis/genesis/assets/urdf/hook/hook.urdf",
+                pos=(0.65, 0.0, 0.02),
+                euler=(0.0, 0.0, -30.0),
+                merge_fixed_links=False
+            )
+            ,vis_mode = 'visual'
+        )
 franka = scene.add_entity(
     gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"),
 )
@@ -61,7 +72,7 @@ qpos = franka.inverse_kinematics(
 )
 # gripper open pos
 qpos[-2:] = 0.04
-path = franka.plan_path(
+path = franka.plan_path_ompl(
     qpos_goal=qpos,
     num_waypoints=200 if "PYTEST_VERSION" not in os.environ else 10,  # 2s duration
 )
@@ -83,7 +94,7 @@ for i in range(100 if "PYTEST_VERSION" not in os.environ else 1):
 # reach
 qpos = franka.inverse_kinematics(
     link=end_effector,
-    pos=np.array([0.65, 0.0, 0.130]),
+    pos=np.array([0.65, 0.0, 0.10]),
     quat=np.array([0, 1, 0, 0]),
 )
 print(qpos)
@@ -94,6 +105,13 @@ for i in range(100 if "PYTEST_VERSION" not in os.environ else 1):
 # grasp
 franka.control_dofs_position(qpos[:-2], motors_dof)
 franka.control_dofs_force(np.array([-0.5, -0.5]), fingers_dof)
+for i in range(100):
+    scene.step()
+
+rigid = scene.sim.rigid_solver
+link_cube = hook.get_link("hook_link").idx
+link_franka = franka.get_link("hand").idx
+rigid.add_weld_constraint(link_cube, link_franka)
 
 for i in range(100 if "PYTEST_VERSION" not in os.environ else 1):
     scene.step()
@@ -104,7 +122,22 @@ qpos = franka.inverse_kinematics(
     pos=np.array([0.65, 0.0, 0.28]),
     quat=np.array([0, 1, 0, 0]),
 )
-print(qpos)
-franka.control_dofs_position(qpos[:-2], motors_dof)
-for i in range(200 if "PYTEST_VERSION" not in os.environ else 1):
+path = franka.plan_path_ompl(
+    qpos_goal=qpos,
+    num_waypoints=200,
+    with_entity=hook,
+    ee_link_name="hand",
+)
+
+# execute the planned path
+for waypoint in path:
+    franka.control_dofs_position(waypoint[:-2], motors_dof)
+    scene.step()
+
+for i in range(100):
+    scene.step()
+
+# release
+rigid.delete_weld_constraint(link_cube, link_franka)
+for i in range(400):
     scene.step()
