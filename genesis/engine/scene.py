@@ -991,7 +991,7 @@ class Scene(RBC):
             return self._visualizer.context.draw_debug_arrow(pos, vec, radius, color)
 
     @gs.assert_built
-    def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01):
+    def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01, origin_color=(255, 255, 255, 255)):
         """
         Draws a 3-axis coordinate frame in the scene for visualization.
 
@@ -1012,7 +1012,7 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_frame(T, axis_length, origin_size, axis_radius)
+            return self._visualizer.context.draw_debug_frame(T, axis_length, origin_size, axis_radius, origin_color)
 
     @gs.assert_built
     def draw_debug_frames(self, Ts, axis_length=1.0, origin_size=0.015, axis_radius=0.01):

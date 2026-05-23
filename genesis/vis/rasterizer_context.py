@@ -786,8 +786,8 @@ class RasterizerContext:
                 self.add_dynamic_node(None, node)
             return node
 
-    def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01):
-        mesh = trimesh.creation.axis(origin_size=origin_size, axis_radius=axis_radius, axis_length=axis_length)
+    def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01, origin_color=(255, 255, 255, 255)):
+        mesh = trimesh.creation.axis(origin_size=origin_size, origin_color=origin_color, axis_radius=axis_radius, axis_length=axis_length)
 
         n_envs = len(self.rendered_envs_idx)
         poses = tensor_to_array(T)

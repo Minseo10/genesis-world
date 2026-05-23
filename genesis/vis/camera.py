@@ -12,6 +12,58 @@ from genesis.constants import IMAGE_TYPE
 from genesis.repr_base import RBC
 from genesis.utils.misc import tensor_to_array
 from genesis.utils.image_exporter import as_grayscale_image
+from typing import Dict, List, Optional
+from PIL import Image
+
+
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def _default_basename(cam_idx: int) -> str:
+    caller_file = inspect.stack()[-1].filename
+    return (
+            os.path.splitext(os.path.basename(caller_file))[0]
+            + f"_cam_{cam_idx}_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
+
+
+def _save_jpg_uint8(path: str, arr: np.ndarray, quality: int = 95):
+    """
+    uint8 (H,W) or (H,W,3) → JPEG 저장
+    """
+    _ensure_dir(path)
+
+    arr = np.asarray(arr)
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+
+    if arr.ndim == 2:
+        im = Image.fromarray(arr, mode="L")
+    elif arr.ndim == 3 and arr.shape[-1] == 3:
+        im = Image.fromarray(arr, mode="RGB")
+    else:
+        raise ValueError(f"Unsupported shape for JPEG: {arr.shape}")
+
+    im.save(path, format="JPEG", quality=quality, subsampling=0)
+
+
+def _save_png_uint16(path: str, arr: np.ndarray):
+    _ensure_dir(path)
+    arr = np.asarray(arr).astype(np.uint16, copy=False)
+    im = Image.fromarray(arr, mode="I;16")
+    im.save(path, format="PNG")
+    with open(path, "rb") as f:
+        assert f.read(8) == b"\x89PNG\r\n\x1a\n"
+
+
+def _to_numpy(x, dtype=None) -> np.ndarray:
+    arr = tensor_to_array(x)
+    if dtype is not None:
+        arr = arr.astype(dtype, copy=False)
+    return arr
 
 
 class Camera(RBC):
@@ -745,6 +797,127 @@ class Camera(RBC):
         self._recorded_t_prev = -1
         self._recorded_imgs.clear()
         self._in_recording = False
+
+    def save_snapshot(
+            self,
+            save_to_filename: str = None,
+            rgb: bool = True,
+            depth: bool = False,
+            segmentation: bool = False,
+            colorize_seg: bool = False,
+            normal: bool = False,
+            save_depth_npy: bool = False,
+    ) -> Dict[str, List[str]]:
+        
+        if save_to_filename is None:
+            caller_file = inspect.stack()[-1].filename
+            base_name = (
+                    os.path.splitext(os.path.basename(caller_file))[0]
+                    + f'_cam_{self.idx}_{time.strftime("%Y%m%d_%H%M%S")}'
+            )
+            base_dir = "."
+        else:
+            base_dir = os.path.dirname(save_to_filename) or "."
+            base_stem = os.path.splitext(os.path.basename(save_to_filename))[0]
+            base_name = base_stem
+
+        os.makedirs(base_dir, exist_ok=True)
+
+        out = {
+            "rgb": [],
+            "depth_jpg": [],
+            "depth_npy": [],
+            "seg_jpg": [],
+            "seg_idx_jpg": [],
+            "normal": [],
+        }
+
+        # 렌더 1회
+        rgb_arr, depth_arr, seg_arr, normal_arr = self.render(
+            rgb=rgb,
+            depth=depth,
+            segmentation=segmentation,
+            colorize_seg=colorize_seg,
+            normal=normal,
+            antialiasing=False,
+            force_render=True,
+        )
+
+        # 배치 렌더링(여러 env)인 경우: 첫 축이 env일 수 있음
+        # (env_separate_rigid=True면 buffer[env] 형태로 내려옴)
+        def _iter_env_buffers(buf):
+            if buf is None:
+                return []
+            arr = _to_numpy(buf)
+            # heuristics: (N, H, W, C) or (N, H, W) 형태면 env-batch로 간주
+            if arr.ndim >= 3 and self._is_batched:
+                # 보통 (N, H, W, ...)로 옴
+                return [arr[i] for i in range(arr.shape[0])]
+            return [arr]
+
+        rgb_list = _iter_env_buffers(rgb_arr)
+        depth_list = _iter_env_buffers(depth_arr)
+        seg_list = _iter_env_buffers(seg_arr)
+        normal_list = _iter_env_buffers(normal_arr)
+
+        # env suffix 붙이기
+        def _suffix(i: int) -> str:
+            return f"_{i}" if (
+                        len(rgb_list) > 1 or len(depth_list) > 1 or len(seg_list) > 1 or len(normal_list) > 1) else ""
+
+        if rgb and rgb_list:
+            for i, im in enumerate(rgb_list):
+                im = im.astype(np.float32, copy=False)
+                if im.max() <= 1.0 + 1e-6:
+                    im *= 255.0
+                im_u8 = np.clip(im, 0, 255).astype(np.uint8)
+                path = f"{save_to_filename}{_suffix(i)}_rgb.jpg"
+                _save_jpg_uint8(path, im_u8)
+                out["rgb"].append(path)
+
+        # Depth 저장
+        if depth and depth_list:
+            for i, d in enumerate(depth_list):
+                depth_vis = as_grayscale_image(d, black_to_white=False)  # returns uint8-like
+                path_jpg = f"{save_to_filename}{_suffix(i)}_depth.jpg"
+                _save_jpg_uint8(path_jpg, depth_vis)
+                out["depth_jpg"].append(path_jpg)
+
+                if save_depth_npy:
+                    path_npy = f"{save_to_filename}{_suffix(i)}_depth.npy"
+                    _ensure_dir(path_npy)
+                    np.save(path_npy, d)
+                    out["depth_npy"].append(path_npy)
+
+        # Segmentation 저장
+        if segmentation and seg_list:
+            for i, s in enumerate(seg_list):
+                if colorize_seg:
+                    if s.ndim == 3 and s.shape[-1] == 3:
+                        s = np.flip(s, axis=-1)  # GUI와 동일 처리 (필요 없을 수도 있지만 안전)
+                    s_u8 = np.clip(s, 0, 255).astype(np.uint8) if s.dtype != np.uint8 else s
+                    path = f"{save_to_filename}{_suffix(i)}_seg.jpg"
+                    _save_jpg_uint8(path, s_u8)
+                    out["seg_jpg"].append(path)
+                else:
+                    # seg idx가 float로 올 수도 있으니 uint16으로 안전 변환
+                    s_u16 = np.clip(s, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+                    path = f"{save_to_filename}{_suffix(i)}_seg_idx.png"
+                    _save_png_uint16(path, s_u16)
+                    out["seg_idx_png"].append(path)
+
+        if normal and normal_list:
+            for i, n in enumerate(normal_list):
+                # (H,W,3) 예상. 값 범위가 [-1,1]이면 [0,1]로 매핑
+                n = n.astype(np.float32, copy=False)
+                if n.min() < -0.1:  # heuristic
+                    n = 0.5 * (n + 1.0)
+                n_u8 = (np.clip(n, 0.0, 1.0) * 255.0).astype(np.uint8)
+                path = f"{save_to_filename}{_suffix(i)}_normal.jpg"
+                _save_jpg_uint8(path, n_u8)
+                out["normal"].append(path)
+
+        return out
 
     def get_pos(self, envs_idx=None):
         """The current position of the camera."""
