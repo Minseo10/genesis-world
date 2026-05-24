@@ -89,6 +89,7 @@ dev = [
     "av",
     # Used for validating polar decomposition in unit tests
     "scipy",
+    "ompl==1.8.0"
 ]
 docs = [
     # Note that currently sphinx 7 does not work, so we must use v6.2.1. Once fixed we can use a later version.
